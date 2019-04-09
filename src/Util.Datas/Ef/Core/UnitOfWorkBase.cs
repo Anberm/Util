@@ -1,5 +1,8 @@
-﻿using Microsoft.EntityFrameworkCore;
+﻿using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.ChangeTracking;
+using Microsoft.EntityFrameworkCore.Metadata.Internal;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -7,16 +10,14 @@ using System.Data;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.EntityFrameworkCore.Metadata.Internal;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 using Util.Datas.Ef.Configs;
 using Util.Datas.UnitOfWorks;
 using Util.Domains.Auditing;
 using Util.Exceptions;
 using Util.Datas.Ef.Logs;
-using Util.Datas.Matedatas;
 using Util.Datas.Sql;
+using Util.Datas.Sql.Matedatas;
+using Util.Datas.Transactions;
 using Util.Helpers;
 using Util.Logs;
 using Util.Sessions;
@@ -33,6 +34,14 @@ namespace Util.Datas.Ef.Core {
         /// 映射字典
         /// </summary>
         private static readonly ConcurrentDictionary<Type, IEnumerable<IMap>> Maps;
+        /// <summary>
+        /// 日志工厂
+        /// </summary>
+        private static readonly ILoggerFactory LoggerFactory;
+        /// <summary>
+        /// 服务提供器
+        /// </summary>
+        private IServiceProvider _serviceProvider;
 
         #endregion
 
@@ -43,6 +52,7 @@ namespace Util.Datas.Ef.Core {
         /// </summary>
         static UnitOfWorkBase() {
             Maps = new ConcurrentDictionary<Type, IEnumerable<IMap>>();
+            LoggerFactory = new LoggerFactory( new[] { new EfLogProvider() } );
         }
 
         #endregion
@@ -53,36 +63,20 @@ namespace Util.Datas.Ef.Core {
         /// 初始化Entity Framework工作单元
         /// </summary>
         /// <param name="options">配置</param>
-        /// <param name="manager">工作单元服务</param>
-        protected UnitOfWorkBase( DbContextOptions options, IUnitOfWorkManager manager )
+        /// <param name="manager">工作单元管理器</param>
+        /// <param name="serviceProvider">服务提供器</param>
+        protected UnitOfWorkBase( DbContextOptions options, IUnitOfWorkManager manager, IServiceProvider serviceProvider )
             : base( options ) {
             manager?.Register( this );
             TraceId = Guid.NewGuid().ToString();
             Session = Util.Security.Sessions.Session.Instance;
-            Config = GetConfig();
-        }
-
-        /// <summary>
-        /// 获取配置
-        /// </summary>
-        private EfConfig GetConfig() {
-            try {
-                var options = Ioc.Create<IOptionsSnapshot<EfConfig>>();
-                return options.Value;
-            }
-            catch {
-                return new EfConfig { EfLogLevel = EfLogLevel.Sql };
-            }
+            _serviceProvider = serviceProvider ?? Ioc.Create<IServiceProvider>();
         }
 
         #endregion
 
         #region 属性
 
-        /// <summary>
-        /// Ef配置
-        /// </summary>
-        protected EfConfig Config { get; }
         /// <summary>
         /// 跟踪号
         /// </summary>
@@ -112,7 +106,8 @@ namespace Util.Datas.Ef.Core {
             if( IsEnabled( log ) == false )
                 return;
             builder.EnableSensitiveDataLogging();
-            builder.UseLoggerFactory( new LoggerFactory( new[] { GetLogProvider( log ) } ) );
+            builder.EnableDetailedErrors();
+            builder.UseLoggerFactory( LoggerFactory );
         }
 
         /// <summary>
@@ -131,7 +126,8 @@ namespace Util.Datas.Ef.Core {
         /// 是否启用Ef日志
         /// </summary>
         private bool IsEnabled( ILog log ) {
-            if( Config.EfLogLevel == EfLogLevel.Off )
+            var config = GetConfig();
+            if( config.EfLogLevel == EfLogLevel.Off )
                 return false;
             if( log.IsTraceEnabled == false )
                 return false;
@@ -139,10 +135,26 @@ namespace Util.Datas.Ef.Core {
         }
 
         /// <summary>
-        /// 获取日志提供器
+        /// 获取配置
         /// </summary>
-        protected virtual ILoggerProvider GetLogProvider( ILog log ) {
-            return new EfLogProvider( log, this, Config );
+        private EfConfig GetConfig() {
+            try {
+                var options = Create<IOptionsSnapshot<EfConfig>>();
+                return options.Value;
+            }
+            catch {
+                return new EfConfig { EfLogLevel = EfLogLevel.Sql };
+            }
+        }
+
+        /// <summary>
+        /// 创建实例
+        /// </summary>
+        private T Create<T>() {
+            var result = _serviceProvider.GetService( typeof( T ) );
+            if ( result == null )
+                return default(T);
+            return (T) result;
         }
 
         #endregion
@@ -210,11 +222,19 @@ namespace Util.Datas.Ef.Core {
             }
         }
 
+        /// <summary>
+        /// 保存更改
+        /// </summary>
+        public override int SaveChanges() {
+            return SaveChangesAsync().GetAwaiter().GetResult();
+        }
+
         #endregion
 
-        #region CommitAsync(异步提交)
+        #region CommitAsync(提交)
+
         /// <summary>
-        /// 异步提交,返回影响的行数
+        /// 提交,返回影响的行数
         /// </summary>
         public async Task<int> CommitAsync() {
             try {
@@ -224,16 +244,16 @@ namespace Util.Datas.Ef.Core {
                 throw new ConcurrencyException( ex );
             }
         }
-        #endregion
-
-        #region SaveChanges(保存更改)
 
         /// <summary>
-        /// 保存更改
+        /// 异步保存更改
         /// </summary>
-        public override int SaveChanges() {
+        public override async Task<int> SaveChangesAsync( CancellationToken cancellationToken = default( CancellationToken ) ) {
             SaveChangesBefore();
-            return base.SaveChanges();
+            var transactionActionManager = Create<ITransactionActionManager>();
+            if( transactionActionManager.Count == 0 )
+                return await base.SaveChangesAsync( cancellationToken );
+            return await TransactionCommit( transactionActionManager, cancellationToken );
         }
 
         /// <summary>
@@ -297,16 +317,29 @@ namespace Util.Datas.Ef.Core {
         protected virtual void InterceptDeletedOperation( EntityEntry entry ) {
         }
 
-        #endregion
-
-        #region SaveChangesAsync(异步保存更改)
         /// <summary>
-        /// 异步保存更改
+        /// 手工创建事务提交
         /// </summary>
-        public override Task<int> SaveChangesAsync( CancellationToken cancellationToken = default( CancellationToken ) ) {
-            SaveChangesBefore();
-            return base.SaveChangesAsync( cancellationToken );
+        private async Task<int> TransactionCommit( ITransactionActionManager transactionActionManager, CancellationToken cancellationToken ) {
+            using( var connection = Database.GetDbConnection() ) {
+                if( connection.State == ConnectionState.Closed )
+                    await connection.OpenAsync( cancellationToken );
+                using( var transaction = connection.BeginTransaction() ) {
+                    try {
+                        await transactionActionManager.CommitAsync( transaction );
+                        Database.UseTransaction( transaction );
+                        var result = await base.SaveChangesAsync( cancellationToken );
+                        transaction.Commit();
+                        return result;
+                    }
+                    catch {
+                        transaction.Rollback();
+                        throw;
+                    }
+                }
+            }
         }
+
         #endregion
 
         #region GetConnection(获取数据库连接)

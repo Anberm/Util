@@ -49,7 +49,16 @@ namespace Util.Biz.Payments.Wechatpay.Services {
         /// <param name="param">支付参数</param>
         protected override void ValidateParam( PayParam param ) {
             if( param.OpenId.IsEmpty() )
-                throw new Warning( "小程序支付必须未设置OpenId" );
+                throw new Warning( "小程序支付必须设置OpenId" );
+        }
+
+        /// <summary>
+        /// 初始化参数生成器
+        /// </summary>
+        /// <param name="builder">参数生成器</param>
+        /// <param name="param">支付参数</param>
+        protected override void InitBuilder( WechatpayParameterBuilder builder, PayParam param ) {
+            builder.OpenId( param.OpenId );
         }
 
         /// <summary>
